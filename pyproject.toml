@@ -1,0 +1,25 @@
+[project]
+name = "epstein-rag"
+version = "0.1.0"
+description = "Epstein documents RAG with Cognee-style ingestion and Postgres storage"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "langchain>=0.3.0",
+  "langchain-core>=0.3.0",
+  "langchain-community>=0.3.0",
+  "langchain-text-splitters>=0.3.0",
+  "tiktoken>=0.7.0",
+  "psycopg[binary]>=3.1.0",
+  "unstructured>=0.15.0",
+  "pypdf>=4.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ipython",
+]
+
+[project.scripts]
+epstein-rag = "main:main"
+
