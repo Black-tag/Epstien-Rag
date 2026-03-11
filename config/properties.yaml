@@ -1,0 +1,24 @@
+ingestion:
+  repository_path: "./epstein-documents"
+  state_file: "./data/ingestion_state.json"
+  chunk_size: 800
+  chunk_overlap: 200
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "postgres"
+  password: "postgres"
+  name: "epstien_files_db"
+
+ollama:
+  endpoint: "http://localhost:11434/api/embed"
+  embedding_model: "snowflake-arctic-embed"
+
+chroma:
+  persist_directory: "./data/chroma"
+  collection_name: "epstein_chunks"
+
+embedding:
+  batch_size: 64
+

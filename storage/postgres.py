@@ -208,3 +208,52 @@ def store_documents_and_chunks(
 
     logger.info("Postgres persistence complete.")
 
+
+def load_all_chunks(
+    cfg: PostgresConfig,
+    limit: int | None = None,
+) -> list[Document]:
+    """
+    Load all chunk rows from Postgres as LangChain Document objects.
+
+    This is used by the embedding-only pipeline to generate embeddings
+    for chunks that have already been ingested.
+    """
+    logger.info(
+        "Loading chunks from Postgres database '%s'%s",
+        cfg.dbname,
+        f" (limit={limit})" if limit is not None else "",
+    )
+
+    with _connect(cfg) as conn:
+        with conn.cursor() as cur:
+            if limit is not None:
+                cur.execute(
+                    """
+                    SELECT content, metadata
+                    FROM chunks
+                    ORDER BY document_id, chunk_index
+                    LIMIT %s;
+                    """,
+                    (int(limit),),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT content, metadata
+                    FROM chunks
+                    ORDER BY document_id, chunk_index;
+                    """
+                )
+
+            rows = cur.fetchall()
+
+    documents: list[Document] = []
+    for content, metadata in rows:
+        # metadata is JSONB; psycopg returns it as a Python dict
+        doc = Document(page_content=content or "", metadata=metadata or {})
+        documents.append(doc)
+
+    logger.info("Loaded %d chunks from Postgres for embedding.", len(documents))
+    return documents
+
