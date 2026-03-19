@@ -1,5 +1,5 @@
 ingestion:
-    repository_path: "./epstein-documents"
+    repository_path: "./epstien-documents"
     state_file: "./data/ingestion_state.json"
     chunk_size: 800
     chunk_overlap: 200
