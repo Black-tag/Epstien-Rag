@@ -14,8 +14,11 @@ dependencies = [
   "unstructured>=0.15.0",
   "pypdf>=4.0.0",
   "requests>=2.32.0",
-  "chromadb>=0.5.0",
+  "pgvector>=0.3.0",
   "pyyaml>=6.0.0",
+  "fastapi>=0.111.0",
+  "uvicorn[standard]>=0.30.0",
+  "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
@@ -25,4 +28,4 @@ dev = [
 
 [project.scripts]
 epstein-rag = "main:main"
-
+epstein-rag-api = "api_server:main"

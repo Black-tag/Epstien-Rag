@@ -1,2 +1,26 @@
+# Environment variables
 .env
+
+# Epstein documents – both spellings covered; MUST never be committed
 epstein-documents/
+epstien-documents/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Data / state files
+data/
+*.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
