@@ -448,6 +448,51 @@ def load_all_chunks(
     return docs
 
 
+def load_file_hashes(cfg: PostgresConfig) -> dict[str, str]:
+    """
+    Return a mapping of ``source_path → content_hash`` for every row
+    currently in the ``documents`` table.
+
+    This is used by the ingestion pipeline as a **Postgres-backed
+    deduplication state store**, replacing the fragile JSON state file.
+
+    On the first call against an empty database the function returns an
+    empty dict, which causes every file to be treated as new.  Subsequent
+    calls reflect whatever was last upserted by
+    :func:`store_documents_and_chunks`.
+    """
+    logger.info(
+        "Loading known file hashes from Postgres database '%s'.", cfg.dbname
+    )
+    try:
+        with _connect(cfg) as conn:
+            # Ensure the schema exists so this can be called safely before
+            # the first ingest run (e.g. during startup health checks).
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT source_path, content_hash FROM documents;"
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        # A DB connection failure at this stage should not crash the server;
+        # return an empty dict so the pipeline treats everything as new and
+        # logs the error for the operator to investigate.
+        logger.error(
+            "Could not load file hashes from Postgres ('%s'): %s – "
+            "treating all files as new.",
+            cfg.dbname,
+            exc,
+        )
+        return {}
+
+    hashes = {row[0]: row[1] for row in rows if row[0] and row[1]}
+    logger.info(
+        "Loaded %d known file hash(es) from Postgres.", len(hashes)
+    )
+    return hashes
+
+
 def load_chunks_without_embeddings(
     cfg: PostgresConfig,
     limit: Optional[int] = None,

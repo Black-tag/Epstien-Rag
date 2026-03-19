@@ -6,6 +6,9 @@ All fields are optional and fall back to:
 2. config/properties.yaml
 3. Environment variables
 4. Hard-coded defaults
+
+Deduplication state is now stored in Postgres (documents.content_hash),
+so there is no state_file field – the DB is the single source of truth.
 """
 
 from __future__ import annotations
@@ -34,14 +37,7 @@ class IngestRequest(BaseModel):
         ),
         examples=["./epstein-documents", "/data/epstein-docs"],
     )
-    state_file: Optional[str] = Field(
-        default=None,
-        description=(
-            "Path to the ingestion-state JSON file used for incremental processing. "
-            "Defaults to ./data/ingestion_state.json."
-        ),
-        examples=["./data/ingestion_state.json"],
-    )
+
     chunk_size: Optional[int] = Field(
         default=None,
         ge=1,
@@ -96,7 +92,7 @@ class IngestRequest(BaseModel):
         "json_schema_extra": {
             "examples": [
                 {
-                    "repository": "./epstein-documents",
+                    "repository": "./epstien-documents",
                     "chunk_size": 800,
                     "chunk_overlap": 200,
                     "db_host": "localhost",

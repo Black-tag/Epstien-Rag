@@ -3,10 +3,15 @@ Ingest router – POST /api/ingest
 
 Runs the complete pipeline in a single background job:
 
-  1. [ETL]       Scan the document repository, parse, chunk, deduplicate
-  2. [Postgres]  Upsert documents + chunks (embedding column starts NULL)
-  3. [Ollama]    Generate embeddings for the inserted chunk texts
-  4. [pgvector]  UPDATE chunks SET embedding = %s::vector for each chunk
+  1. [Postgres]  Load known file hashes from the documents table (dedup state)
+  2. [ETL]       Scan the document repository, parse, chunk, deduplicate
+  3. [Postgres]  Upsert file-level documents + chunks (embedding column starts NULL)
+  4. [Ollama]    Generate embeddings for the inserted chunk texts
+  5. [pgvector]  UPDATE chunks SET embedding = %s::vector for each chunk
+
+Deduplication is backed entirely by Postgres – no JSON state file is written
+or read.  The documents.content_hash column is the single source of truth for
+whether a file has changed since the last ingest run.
 
 Returns 202 Accepted immediately with a job_id.
 Poll GET /api/jobs/{job_id} for progress and the final result.
@@ -26,9 +31,14 @@ from api.models.requests import IngestRequest
 from api.models.responses import JobResponse
 from api.services.job_manager import JobStatus, job_manager
 from config.loader import load_properties
-from ingestion import IngestionConfig, IngestionState, ingest_repository
+from ingestion import IngestionConfig, ingest_repository
 from ingestion.embeddings import embed_chunks_with_ollama
-from storage import PostgresConfig, store_documents_and_chunks, update_chunk_embeddings
+from storage import (
+    PostgresConfig,
+    load_file_hashes,
+    store_documents_and_chunks,
+    update_chunk_embeddings,
+)
 
 router = APIRouter(prefix="/api", tags=["Ingestion"])
 logger = logging.getLogger(__name__)
@@ -63,7 +73,18 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
         embedding_dimensions: int = int(embedding_cfg.get("dimensions", 1024))
 
         # ----------------------------------------------------------------
-        # Step 1 – resolve repository path
+        # Step 1 – build Postgres config (needed for dedup + storage)
+        # ----------------------------------------------------------------
+        pg_cfg = PostgresConfig(
+            host=req.db_host or db_cfg.get("host", "localhost"),
+            port=req.db_port or int(db_cfg.get("port", 5432)),
+            user=req.db_user or db_cfg.get("user", "postgres"),
+            password=req.db_password or db_cfg.get("password", "postgres"),
+            dbname=req.db_name or db_cfg.get("name", "epstien_files_db"),
+        )
+
+        # ----------------------------------------------------------------
+        # Step 2 – resolve repository path
         # ----------------------------------------------------------------
         env_repo = os.getenv("EPSTEIN_DOCS_PATH")
 
@@ -87,16 +108,6 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
             repository_path.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------------------------------------------
-        # Step 2 – resolve state file
-        # ----------------------------------------------------------------
-        if req.state_file:
-            state_file = Path(req.state_file).resolve()
-        elif ingestion_cfg.get("state_file"):
-            state_file = (project_root / ingestion_cfg["state_file"]).resolve()
-        else:
-            state_file = project_root / "data" / "ingestion_state.json"
-
-        # ----------------------------------------------------------------
         # Step 3 – chunking parameters
         # ----------------------------------------------------------------
         chunk_size: int = req.chunk_size or int(ingestion_cfg.get("chunk_size", 800))
@@ -105,15 +116,23 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
         )
 
         # ----------------------------------------------------------------
-        # Step 4 – ETL: scan, parse, chunk, deduplicate
+        # Step 4 – load known file hashes from Postgres (dedup state)
+        # ----------------------------------------------------------------
+        known_file_hashes = load_file_hashes(pg_cfg)
+        logger.info(
+            "Job %s: loaded %d known file hash(es) from Postgres.",
+            job_id,
+            len(known_file_hashes),
+        )
+
+        # ----------------------------------------------------------------
+        # Step 5 – ETL: scan, parse, deduplicate (Postgres-backed), chunk
         # ----------------------------------------------------------------
         config = IngestionConfig(
             repository_path=repository_path,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            state_file=state_file,
         )
-        state = IngestionState.load(config.state_file)
 
         logger.info(
             "Job %s: running ETL on %s (chunk_size=%d, chunk_overlap=%d).",
@@ -123,7 +142,7 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
             chunk_overlap,
         )
 
-        output = ingest_repository(config=config, state=state)
+        output = ingest_repository(config=config, known_file_hashes=known_file_hashes)
         documents: list[Document] = output.get("documents", [])
         chunks: list[Document] = output.get("chunks", [])
 
@@ -144,19 +163,10 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
             return
 
         # ----------------------------------------------------------------
-        # Step 5 – persist documents + chunks to Postgres
-        #           store_documents_and_chunks returns the (db_id, content)
-        #           pair for every successfully inserted chunk row so we
-        #           never need to reload from the database in this pipeline.
+        # Step 6 – persist file-level documents + chunks to Postgres
+        #           store_documents_and_chunks returns (db_id, content) pairs
+        #           for every inserted chunk – no second DB round-trip needed.
         # ----------------------------------------------------------------
-        pg_cfg = PostgresConfig(
-            host=req.db_host or db_cfg.get("host", "localhost"),
-            port=req.db_port or int(db_cfg.get("port", 5432)),
-            user=req.db_user or db_cfg.get("user", "postgres"),
-            password=req.db_password or db_cfg.get("password", "postgres"),
-            dbname=req.db_name or db_cfg.get("name", "epstien_files_db"),
-        )
-
         chunk_records: List[Tuple[int, str]] = store_documents_and_chunks(
             documents=documents,
             chunks=chunks,
@@ -165,14 +175,14 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
         )
 
         logger.info(
-            "Job %s: %d document(s) and %d chunk(s) persisted to Postgres.",
+            "Job %s: %d file-doc(s) and %d chunk(s) persisted to Postgres.",
             job_id,
             len(documents),
             len(chunk_records),
         )
 
         # ----------------------------------------------------------------
-        # Step 6 – generate embeddings via Ollama
+        # Step 7 – generate embeddings via Ollama
         #           We wrap the stored chunk contents in lightweight Document
         #           objects so embed_chunks_with_ollama can access .page_content.
         #           The chunk_db_ids list is kept in the same order so that
@@ -234,7 +244,7 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
             )
 
             # ----------------------------------------------------------------
-            # Step 7 – write embeddings back to Postgres via pgvector
+            # Step 8 – write embeddings back to Postgres via pgvector
             #           UPDATE chunks SET embedding = %s::vector WHERE id = %s
             # ----------------------------------------------------------------
             update_chunk_embeddings(
@@ -257,7 +267,7 @@ def _ingest_task(job_id: str, req: IngestRequest) -> None:
             )
 
         # ----------------------------------------------------------------
-        # Step 8 – mark job complete
+        # Step 9 – mark job complete
         # ----------------------------------------------------------------
         job_manager.update_job(
             job_id,

@@ -7,10 +7,11 @@ from typing import List, Tuple
 from langchain_core.documents import Document
 
 from config.loader import load_properties
-from ingestion import IngestionConfig, IngestionState, ingest_repository
+from ingestion import IngestionConfig, ingest_repository
 from ingestion.embeddings import embed_chunks_with_ollama
 from storage import (
     PostgresConfig,
+    load_file_hashes,
     store_documents_and_chunks,
     update_chunk_embeddings,
 )
@@ -27,10 +28,14 @@ def _run_ingest(args: argparse.Namespace) -> None:
     """
     Run the full ingestion pipeline:
 
-        1. ETL  – scan the document repository, parse, chunk, deduplicate
-        2. SQL  – upsert documents + chunks to Postgres (embedding = NULL)
-        3. Embed – generate vectors via Ollama for every inserted chunk
-        4. pgvector – UPDATE chunks SET embedding = %s::vector
+        1. Postgres – load known file hashes (dedup state)
+        2. ETL      – scan the document repository, parse, chunk, deduplicate
+        3. Postgres – upsert file-level documents + chunks (embedding = NULL)
+        4. Ollama   – generate vectors via Ollama for every inserted chunk
+        5. pgvector – UPDATE chunks SET embedding = %s::vector
+
+    Deduplication is backed by Postgres – no JSON state file is written.
+    The documents.content_hash column is the single source of truth.
 
     Configuration priority for every value:
         1. CLI argument
@@ -49,7 +54,18 @@ def _run_ingest(args: argparse.Namespace) -> None:
     embedding_dimensions: int = int(embedding_cfg.get("dimensions", 1024))
 
     # ------------------------------------------------------------------
-    # Resolve repository path
+    # Step 1 – build Postgres config (needed for dedup + storage)
+    # ------------------------------------------------------------------
+    pg_cfg = PostgresConfig(
+        host=args.db_host or db_cfg.get("host", "localhost"),
+        port=args.db_port or int(db_cfg.get("port", 5432)),
+        user=args.db_user or db_cfg.get("user", "postgres"),
+        password=args.db_password or db_cfg.get("password", "postgres"),
+        dbname=args.db_name or db_cfg.get("name", "epstien_files_db"),
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2 – resolve repository path
     # ------------------------------------------------------------------
     env_repo = os.getenv("EPSTEIN_DOCS_PATH")
 
@@ -72,17 +88,7 @@ def _run_ingest(args: argparse.Namespace) -> None:
         repository_path.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Resolve state file
-    # ------------------------------------------------------------------
-    if args.state_file:
-        state_file = Path(args.state_file).resolve()
-    elif ingestion_cfg.get("state_file"):
-        state_file = (project_root / ingestion_cfg["state_file"]).resolve()
-    else:
-        state_file = project_root / "data" / "ingestion_state.json"
-
-    # ------------------------------------------------------------------
-    # Chunking parameters
+    # Step 3 – chunking parameters
     # ------------------------------------------------------------------
     chunk_size: int = args.chunk_size or int(ingestion_cfg.get("chunk_size", 800))
     chunk_overlap: int = args.chunk_overlap or int(
@@ -92,42 +98,41 @@ def _run_ingest(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Step 1 – ETL
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Step 4 – load known file hashes from Postgres (dedup state)
+    # ------------------------------------------------------------------
+    known_file_hashes = load_file_hashes(pg_cfg)
+    logger.info(
+        "Loaded %d known file hash(es) from Postgres.", len(known_file_hashes)
+    )
+
+    # ------------------------------------------------------------------
+    # Step 5 – ETL: scan, parse, deduplicate (Postgres-backed), chunk
+    # ------------------------------------------------------------------
     config = IngestionConfig(
         repository_path=repository_path,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        state_file=state_file,
     )
 
-    state = IngestionState.load(config.state_file)
-
     logger.info("Ingesting repository at %s", repository_path)
-    logger.info("State file: %s", state_file)
 
-    output = ingest_repository(config=config, state=state)
+    output = ingest_repository(config=config, known_file_hashes=known_file_hashes)
 
     documents: list[Document] = output.get("documents", [])
     chunks: list[Document] = output.get("chunks", [])
 
-    logger.info("ETL complete – %d document(s), %d chunk(s).", len(documents), len(chunks))
+    logger.info("ETL complete – %d file-doc(s), %d chunk(s).", len(documents), len(chunks))
 
     if not documents and not chunks:
         logger.info("Nothing to process – exiting.")
         return
 
     # ------------------------------------------------------------------
-    # Step 2 – Persist documents + chunks to Postgres
+    # Step 6 – Persist file-level documents + chunks to Postgres
     #          store_documents_and_chunks returns (chunk_db_id, content)
     #          pairs in insertion order so we never need a reload step.
     # ------------------------------------------------------------------
-    pg_cfg = PostgresConfig(
-        host=args.db_host or db_cfg.get("host", "localhost"),
-        port=args.db_port or int(db_cfg.get("port", 5432)),
-        user=args.db_user or db_cfg.get("user", "postgres"),
-        password=args.db_password or db_cfg.get("password", "postgres"),
-        dbname=args.db_name or db_cfg.get("name", "epstien_files_db"),
-    )
-
     chunk_records: List[Tuple[int, str]] = store_documents_and_chunks(
         documents=documents,
         chunks=chunks,
@@ -136,7 +141,7 @@ def _run_ingest(args: argparse.Namespace) -> None:
     )
 
     logger.info(
-        "Postgres write complete – %d document(s), %d chunk(s) inserted.",
+        "Postgres write complete – %d file-doc(s), %d chunk(s) inserted.",
         len(documents),
         len(chunk_records),
     )
@@ -146,7 +151,7 @@ def _run_ingest(args: argparse.Namespace) -> None:
         return
 
     # ------------------------------------------------------------------
-    # Step 3 – Generate embeddings via Ollama
+    # Step 7 – Generate embeddings via Ollama
     # ------------------------------------------------------------------
     ollama_model: str = ollama_cfg.get("embedding_model", "snowflake-arctic-embed")
     ollama_endpoint: str = ollama_cfg.get(
@@ -188,7 +193,7 @@ def _run_ingest(args: argparse.Namespace) -> None:
     )
 
     # ------------------------------------------------------------------
-    # Step 4 – Write embeddings to Postgres via pgvector
+    # Step 8 – Write embeddings to Postgres via pgvector
     #          UPDATE chunks SET embedding = %s::vector WHERE id = %s
     # ------------------------------------------------------------------
     update_chunk_embeddings(
@@ -198,7 +203,7 @@ def _run_ingest(args: argparse.Namespace) -> None:
     )
 
     logger.info(
-        "Pipeline complete – %d doc(s) | %d chunk(s) | %d embedding(s) written to Postgres.",
+        "Pipeline complete – %d file-doc(s) | %d chunk(s) | %d embedding(s) written to Postgres.",
         len(documents),
         len(chunk_records),
         len(embeddings),
@@ -209,7 +214,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Epstein RAG – full ingestion pipeline CLI.\n\n"
-            "Runs ETL → Postgres → Ollama embeddings → pgvector in one shot."
+            "Runs Postgres dedup → ETL → Postgres → Ollama embeddings → pgvector."
         ),
     )
 
@@ -221,8 +226,9 @@ def main() -> None:
     ingest_parser = subparsers.add_parser(
         "ingest",
         help=(
-            "Run the full pipeline: parse documents, chunk, persist to "
-            "Postgres, generate Ollama embeddings, store via pgvector."
+            "Run the full pipeline: load dedup state from Postgres, parse "
+            "documents, chunk, persist to Postgres, generate Ollama "
+            "embeddings, store via pgvector."
         ),
     )
     ingest_parser.add_argument(
@@ -231,12 +237,6 @@ def main() -> None:
         type=str,
         default=None,
         help="Path to the documents repository (default: ./epstein-documents).",
-    )
-    ingest_parser.add_argument(
-        "--state-file",
-        type=str,
-        default=None,
-        help="Path to ingestion state JSON file (default: ./data/ingestion_state.json).",
     )
     ingest_parser.add_argument(
         "--chunk-size",

@@ -13,6 +13,7 @@ from .postgres import (
     update_chunk_embeddings,
     load_all_chunks,
     load_chunks_without_embeddings,
+    load_file_hashes,
 )
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "update_chunk_embeddings",
     "load_all_chunks",
     "load_chunks_without_embeddings",
+    "load_file_hashes",
 ]

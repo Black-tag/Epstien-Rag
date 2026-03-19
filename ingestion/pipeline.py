@@ -464,28 +464,115 @@ def _load_file(path: Path, encoding: str) -> List[Document]:
 
 def _deduplicate_documents(
     docs: Sequence[Document],
-    state: IngestionState,
+    known_hashes: Dict[str, str],
+    state: Optional[IngestionState] = None,
 ) -> List[Document]:
     """
-    Deduplicate documents based on content hash.
+    Deduplicate at the FILE level, not the page level.
 
-    This operates at the file-level granularity by default (same path & hash),
-    but can be extended to chunk-level deduplication if needed.
+    PyPDFLoader (and other loaders) produce one Document per page, all
+    sharing the same ``source_path``.  The old per-page loop overwrote
+    ``known_hashes[path]`` on every page, leaving only the LAST page's
+    hash stored.  On the next run every page except the last looked "new"
+    and the whole corpus was re-processed.
+
+    Fix: group all page-Documents by ``source_path``, compute ONE combined
+    hash over all their content, and skip or include the entire file as a
+    unit.  ``known_hashes`` is mutated in-place so the caller's dict (which
+    may come from Postgres or from ``IngestionState``) is kept up-to-date
+    for the duration of the run.
+
+    Parameters
+    ----------
+    docs:
+        All page-level Documents loaded from the repository.
+    known_hashes:
+        Mapping of ``source_path → content_hash`` representing files that
+        have already been ingested.  Comes from Postgres (production) or
+        from ``IngestionState.file_hashes`` (CLI fallback).
+    state:
+        Optional ``IngestionState``; when provided its ``file_hashes`` dict
+        is also updated so the JSON fallback stays consistent.
     """
-    deduped: List[Document] = []
+    from collections import defaultdict
+
+    no_path: List[Document] = []
+    by_file: Dict[str, List[Document]] = defaultdict(list)
+
     for doc in docs:
         source_path = doc.metadata.get("source_path")
         if not source_path:
-            deduped.append(doc)
+            no_path.append(doc)
+        else:
+            by_file[source_path].append(doc)
+
+    deduped: List[Document] = list(no_path)
+
+    for source_path, pages in by_file.items():
+        # Combine ALL page texts → stable file-level fingerprint
+        combined_text = "\n".join(p.page_content for p in pages)
+        file_hash = _compute_text_hash(combined_text)
+
+        if known_hashes.get(source_path) == file_hash:
+            logger.info(
+                "Skipping unchanged file: %s (%d page(s))",
+                source_path,
+                len(pages),
+            )
             continue
-        text_hash = _compute_text_hash(doc.page_content)
-        previous_hash = state.file_hashes.get(source_path)
-        if previous_hash == text_hash:
-            logger.info("Skipping unchanged document: %s", source_path)
-            continue
-        state.file_hashes[source_path] = text_hash
-        deduped.append(doc)
+
+        # New or changed – update both in-memory stores
+        known_hashes[source_path] = file_hash
+        if state is not None:
+            state.file_hashes[source_path] = file_hash
+
+        deduped.extend(pages)
+        logger.debug(
+            "Queuing changed/new file: %s (%d page(s))", source_path, len(pages)
+        )
+
     return deduped
+
+
+def _consolidate_to_file_documents(docs: Sequence[Document]) -> List[Document]:
+    """
+    Collapse per-page Documents into one Document per source file.
+
+    The ``documents`` Postgres table has ``source_path UNIQUE``, so it is
+    inherently file-level.  Passing page-level docs to
+    ``store_documents_and_chunks`` causes repeated upserts on the same row,
+    leaving only the last page's ``content_hash`` stored – which breaks
+    Postgres-backed deduplication on the next run.
+
+    This function produces one Document per file whose:
+    - ``page_content`` is all page texts joined with ``\\n``
+    - ``metadata``    is copied from the first page with ``page_count`` added
+
+    The consolidated Documents are used exclusively for the ``documents``
+    table.  Chunking still operates on the original page-level Documents so
+    that page boundaries are respected.
+    """
+    from collections import defaultdict
+
+    no_path: List[Document] = []
+    by_file: Dict[str, List[Document]] = defaultdict(list)
+
+    for doc in docs:
+        source_path = doc.metadata.get("source_path")
+        if not source_path:
+            no_path.append(doc)
+        else:
+            by_file[source_path].append(doc)
+
+    consolidated: List[Document] = list(no_path)
+
+    for source_path, pages in by_file.items():
+        combined_text = "\n".join(p.page_content for p in pages)
+        metadata = dict(pages[0].metadata)
+        metadata["page_count"] = len(pages)
+        consolidated.append(Document(page_content=combined_text, metadata=metadata))
+
+    return consolidated
 
 
 def _chunk_documents(
@@ -662,28 +749,68 @@ def _chunk_documents(
 def ingest_repository(
     config: IngestionConfig,
     state: Optional[IngestionState] = None,
+    known_file_hashes: Optional[Dict[str, str]] = None,
 ) -> Mapping[str, List[Document]]:
     """
     Ingest all supported documents from a repository path.
 
-    Returns a mapping:
+    Returns a mapping::
+
         {
-            "documents": [normalized, deduplicated Document objects],
-            "chunks": [chunked Document objects ready for embedding],
+            "documents": [one file-level Document per changed/new file],
+            "chunks":    [chunked page-level Documents ready for embedding],
         }
 
-    This is designed as a reusable interface that can be called from:
-    - Batch jobs (cron / scheduled tasks)
-    - Streaming or event-driven triggers (e.g. on new file arrival)
+    The ``documents`` list contains **one entry per source file** (all pages
+    merged) so that ``store_documents_and_chunks`` writes exactly one row per
+    file to the ``documents`` Postgres table.  Chunking is still performed on
+    the original page-level Documents so page boundaries are preserved.
+
+    Parameters
+    ----------
+    config:
+        Ingestion configuration (repository path, chunk settings, etc.).
+    state:
+        Optional ``IngestionState`` used as a **fallback** deduplication
+        store when ``known_file_hashes`` is not provided (e.g. CLI usage
+        without a live DB connection).  Mutated in-place and saved to the
+        JSON state file at the end of the run.
+    known_file_hashes:
+        Mapping of ``source_path → content_hash`` loaded from the Postgres
+        ``documents`` table.  When provided this is the **primary**
+        deduplication source and the JSON state file is not written.
+        Pass ``{}`` on the very first run (empty DB).
     """
     logger.info("Starting ingestion for repository: %s", config.repository_path)
 
     repository_path = config.repository_path
     if not repository_path.exists() or not repository_path.is_dir():
-        raise ValueError(f"Repository path does not exist or is not a directory: {repository_path}")
+        raise ValueError(
+            f"Repository path does not exist or is not a directory: {repository_path}"
+        )
 
-    if state is None:
-        state = IngestionState.load(config.state_file)
+    # ------------------------------------------------------------------
+    # Decide which hash store to use for deduplication
+    # ------------------------------------------------------------------
+    use_db_hashes = known_file_hashes is not None
+
+    if use_db_hashes:
+        # Postgres-backed: work on a shallow copy so we don't mutate the
+        # caller's dict if something fails mid-run.
+        effective_hashes: Dict[str, str] = dict(known_file_hashes)
+        logger.info(
+            "Using Postgres-backed deduplication (%d known file(s)).",
+            len(effective_hashes),
+        )
+    else:
+        # CLI fallback: load from JSON state file
+        if state is None:
+            state = IngestionState.load(config.state_file)
+        effective_hashes = state.file_hashes
+        logger.info(
+            "Using JSON state-file deduplication (%d known file(s)).",
+            len(effective_hashes),
+        )
 
     allowed_exts = {ext.lower().lstrip(".") for ext in config.allowed_extensions}
 
@@ -705,11 +832,8 @@ def ingest_repository(
             skipped_files += 1
             continue
 
-        # Normalize and clean text content before deduplication and chunking
         for doc in raw_docs:
-            # Basic normalization and removal of repeated headers/footers
             cleaned = clean_text(doc.page_content)
-            # Extract any leading email headers into metadata and remove them from body text
             headers, body_without_headers = extract_email_headers(cleaned)
             if headers:
                 metadata = dict(doc.metadata or {})
@@ -724,30 +848,45 @@ def ingest_repository(
 
     logger.info("Loaded %d documents from %d files", len(all_docs), processed_files)
 
-    # Deduplicate based on content hash + path
-    deduped_docs = _deduplicate_documents(all_docs, state=state)
-    new_documents = len(deduped_docs)
+    # ------------------------------------------------------------------
+    # File-level deduplication
+    # ------------------------------------------------------------------
+    deduped_page_docs = _deduplicate_documents(
+        all_docs,
+        known_hashes=effective_hashes,
+        state=state if not use_db_hashes else None,
+    )
+
+    # One file-level Document per changed/new source file → documents table
+    file_docs = _consolidate_to_file_documents(deduped_page_docs)
+    new_files = len(file_docs)
+
     logger.info(
-        "Deduplication complete. %d new/changed documents, %d skipped files",
-        new_documents,
+        "Deduplication complete: %d new/changed file(s), %d skipped, %d load error(s).",
+        new_files,
+        processed_files - new_files,
         skipped_files,
     )
 
-    # Chunk documents for downstream embedding
+    # ------------------------------------------------------------------
+    # Chunk from page-level docs (preserves page boundaries)
+    # ------------------------------------------------------------------
     chunks = _chunk_documents(
-        docs=deduped_docs,
+        docs=deduped_page_docs,
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
     )
 
-    logger.info("Generated %d chunks from %d documents", len(chunks), new_documents)
+    logger.info("Generated %d chunk(s) from %d file(s).", len(chunks), new_files)
 
-    # Update and persist state for future incremental runs
-    state.last_run_at = datetime.utcnow().isoformat() + "Z"
-    state.save(config.state_file)
+    # ------------------------------------------------------------------
+    # Persist JSON state only when NOT using Postgres-backed dedup
+    # ------------------------------------------------------------------
+    if not use_db_hashes and state is not None:
+        state.last_run_at = datetime.utcnow().isoformat() + "Z"
+        state.save(config.state_file)
 
     return {
-        "documents": deduped_docs,
-        "chunks": chunks,
+        "documents": file_docs,   # file-level → one row per file in documents table
+        "chunks": chunks,          # page-level chunks → chunks table
     }
-
